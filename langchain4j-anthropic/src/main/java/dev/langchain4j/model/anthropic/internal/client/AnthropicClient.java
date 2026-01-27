@@ -2,28 +2,45 @@ package dev.langchain4j.model.anthropic.internal.client;
 
 import dev.langchain4j.Internal;
 import dev.langchain4j.http.client.HttpClientBuilder;
+import dev.langchain4j.model.anthropic.internal.api.AnthropicCountTokensRequest;
 import dev.langchain4j.model.anthropic.internal.api.AnthropicCreateMessageRequest;
 import dev.langchain4j.model.anthropic.internal.api.AnthropicCreateMessageResponse;
+import dev.langchain4j.model.anthropic.internal.api.AnthropicModelsListResponse;
+import dev.langchain4j.model.anthropic.internal.api.MessageTokenCountResponse;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.spi.ServiceHelper;
-
 import java.time.Duration;
+import org.slf4j.Logger;
 
 @Internal
 public abstract class AnthropicClient {
 
     public abstract AnthropicCreateMessageResponse createMessage(AnthropicCreateMessageRequest request);
 
+    public ParsedAndRawResponse createMessageWithRawResponse(AnthropicCreateMessageRequest request) {
+        AnthropicCreateMessageResponse parsedResponse = createMessage(request);
+        return new ParsedAndRawResponse(parsedResponse, null);
+    }
+
     /**
      * @since 1.2.0
      */
-    public void createMessage(AnthropicCreateMessageRequest request,
-                              AnthropicCreateMessageOptions options,
-                              StreamingChatResponseHandler handler) {
+    public void createMessage(
+            AnthropicCreateMessageRequest request,
+            AnthropicCreateMessageOptions options,
+            StreamingChatResponseHandler handler) {
         createMessage(request, handler);
     }
 
     public abstract void createMessage(AnthropicCreateMessageRequest request, StreamingChatResponseHandler handler);
+
+    public MessageTokenCountResponse countTokens(AnthropicCountTokensRequest request) {
+        throw new UnsupportedOperationException("Token counting is not implemented");
+    }
+
+    public AnthropicModelsListResponse listModels() {
+        throw new UnsupportedOperationException("Model listing is not supported by this client implementation");
+    }
 
     @SuppressWarnings("rawtypes")
     public static AnthropicClient.Builder builder() {
@@ -42,6 +59,7 @@ public abstract class AnthropicClient {
         public String version;
         public String beta;
         public Duration timeout;
+        public Logger logger;
         public Boolean logRequests;
         public Boolean logResponses;
 
@@ -98,6 +116,15 @@ public abstract class AnthropicClient {
                 logResponses = false;
             }
             this.logResponses = logResponses;
+            return (B) this;
+        }
+
+        /**
+         * @param logger an alternate {@link Logger} to be used instead of the default one provided by Langchain4J for logging requests and responses.
+         * @return {@code this}.
+         */
+        public B logger(Logger logger) {
+            this.logger = logger;
             return (B) this;
         }
     }

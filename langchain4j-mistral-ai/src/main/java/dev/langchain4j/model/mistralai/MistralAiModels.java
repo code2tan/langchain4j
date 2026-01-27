@@ -10,12 +10,15 @@ import dev.langchain4j.model.mistralai.internal.api.MistralAiModelResponse;
 import dev.langchain4j.model.mistralai.internal.client.MistralAiClient;
 import dev.langchain4j.model.mistralai.spi.MistralAiModelsBuilderFactory;
 import dev.langchain4j.model.output.Response;
+import org.slf4j.Logger;
 import java.time.Duration;
 import java.util.List;
 
 /**
  * Represents a collection of Mistral AI models.
  * You can find description of parameters <a href="https://docs.mistral.ai/api/#operation/listModels">here</a>.
+ *
+ * @see MistralAiModels
  */
 public class MistralAiModels {
 
@@ -30,6 +33,7 @@ public class MistralAiModels {
                 .timeout(builder.timeout)
                 .logRequests(getOrDefault(builder.logRequests, false))
                 .logResponses(getOrDefault(builder.logResponses, false))
+                .logger(builder.logger)
                 .build();
         this.maxRetries = getOrDefault(builder.maxRetries, 2);
     }
@@ -63,6 +67,7 @@ public class MistralAiModels {
         private Duration timeout;
         private Boolean logRequests;
         private Boolean logResponses;
+        private Logger logger;
         private Integer maxRetries;
 
         public MistralAiModelsBuilder() {}
@@ -115,6 +120,15 @@ public class MistralAiModels {
          */
         public MistralAiModelsBuilder logResponses(Boolean logResponses) {
             this.logResponses = logResponses;
+            return this;
+        }
+
+        /**
+         * @param logger an alternate {@link Logger} to be used instead of the default one provided by Langchain4J for logging requests and responses.
+         * @return {@code this}.
+         */
+        public MistralAiModelsBuilder logger(Logger logger) {
+            this.logger = logger;
             return this;
         }
 

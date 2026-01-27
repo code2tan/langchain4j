@@ -9,6 +9,11 @@ import static dev.langchain4j.model.bedrock.AwsDocumentConverter.convertAddition
 import static dev.langchain4j.model.bedrock.AwsDocumentConverter.convertJsonObjectSchemaToDocument;
 import static dev.langchain4j.model.bedrock.AwsDocumentConverter.documentFromJson;
 import static dev.langchain4j.model.bedrock.AwsDocumentConverter.documentToJson;
+import static dev.langchain4j.model.bedrock.GuardrailAssessment.Policy.CONTENT;
+import static dev.langchain4j.model.bedrock.GuardrailAssessment.Policy.CONTEXT;
+import static dev.langchain4j.model.bedrock.GuardrailAssessment.Policy.SENSITIVE;
+import static dev.langchain4j.model.bedrock.GuardrailAssessment.Policy.TOPIC;
+import static dev.langchain4j.model.bedrock.GuardrailAssessment.Policy.WORD;
 import static dev.langchain4j.model.bedrock.Utils.extractAndValidateFormat;
 import static java.util.Collections.emptyList;
 import static java.util.Objects.nonNull;
@@ -35,8 +40,8 @@ import dev.langchain4j.model.chat.request.DefaultChatRequestParameters;
 import dev.langchain4j.model.chat.request.ResponseFormatType;
 import dev.langchain4j.model.chat.request.ToolChoice;
 import dev.langchain4j.model.chat.response.PartialThinking;
+import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.output.FinishReason;
-import dev.langchain4j.model.output.TokenUsage;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -48,6 +53,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import org.slf4j.Logger;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.core.document.Document;
 import software.amazon.awssdk.regions.Region;
@@ -55,9 +61,13 @@ import software.amazon.awssdk.services.bedrockruntime.model.AnyToolChoice;
 import software.amazon.awssdk.services.bedrockruntime.model.ContentBlock;
 import software.amazon.awssdk.services.bedrockruntime.model.ConversationRole;
 import software.amazon.awssdk.services.bedrockruntime.model.ConverseResponse;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseTrace;
 import software.amazon.awssdk.services.bedrockruntime.model.DocumentBlock;
 import software.amazon.awssdk.services.bedrockruntime.model.DocumentFormat;
 import software.amazon.awssdk.services.bedrockruntime.model.DocumentSource;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailConfiguration;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailStreamConfiguration;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailTrace;
 import software.amazon.awssdk.services.bedrockruntime.model.ImageBlock;
 import software.amazon.awssdk.services.bedrockruntime.model.ImageSource;
 import software.amazon.awssdk.services.bedrockruntime.model.InferenceConfiguration;
@@ -76,7 +86,8 @@ import software.amazon.awssdk.services.bedrockruntime.model.ToolUseBlock;
 @Internal
 abstract class AbstractBedrockChatModel {
 
-    private static final String THINKING_SIGNATURE_KEY = "thinking_signature"; // do not change, will break backward compatibility!
+    private static final String THINKING_SIGNATURE_KEY =
+            "thinking_signature"; // do not change, will break backward compatibility!
 
     protected final Region region;
     protected final Duration timeout;
@@ -100,9 +111,10 @@ abstract class AbstractBedrockChatModel {
             commonParameters = DefaultChatRequestParameters.EMPTY;
         }
 
-        BedrockChatRequestParameters bedrockParameters = builder.defaultRequestParameters instanceof BedrockChatRequestParameters bedrockChatRequestParameters ?
-                bedrockChatRequestParameters :
-                BedrockChatRequestParameters.EMPTY;
+        BedrockChatRequestParameters bedrockParameters =
+                builder.defaultRequestParameters instanceof BedrockChatRequestParameters bedrockChatRequestParameters
+                        ? bedrockChatRequestParameters
+                        : BedrockChatRequestParameters.EMPTY;
 
         this.defaultRequestParameters = BedrockChatRequestParameters.builder()
                 // common parameters
@@ -115,28 +127,75 @@ abstract class AbstractBedrockChatModel {
                 .toolChoice(commonParameters.toolChoice())
                 // Bedrock-specific parameters
                 .additionalModelRequestFields(bedrockParameters.additionalModelRequestFields())
+                .promptCaching(bedrockParameters.cachePointPlacement())
+                .guardrailConfiguration(bedrockParameters.bedrockGuardrailConfiguration())
                 .build();
     }
 
     protected List<SystemContentBlock> extractSystemMessages(List<ChatMessage> messages) {
-        return messages.stream()
-                .filter(message -> message.type() == ChatMessageType.SYSTEM)
-                .map(message -> SystemContentBlock.builder()
+        return extractSystemMessages(messages, null);
+    }
+
+    protected List<SystemContentBlock> extractSystemMessages(
+            List<ChatMessage> messages, BedrockCachePointPlacement cachePointPlacement) {
+        List<SystemContentBlock> systemBlocks = new ArrayList<>();
+
+        for (ChatMessage message : messages) {
+            if (message.type() == ChatMessageType.SYSTEM) {
+                systemBlocks.add(SystemContentBlock.builder()
                         .text(((SystemMessage) message).text())
-                        .build())
-                .toList();
+                        .build());
+            }
+        }
+
+        if (cachePointPlacement == BedrockCachePointPlacement.AFTER_SYSTEM && !systemBlocks.isEmpty()) {
+            systemBlocks.add(SystemContentBlock.builder()
+                    .cachePoint(software.amazon.awssdk.services.bedrockruntime.model.CachePointBlock.builder()
+                            .type("default")
+                            .build())
+                    .build());
+        }
+
+        return systemBlocks;
     }
 
     protected List<Message> extractRegularMessages(List<ChatMessage> messages) {
+        return extractRegularMessages(messages, null);
+    }
+
+    protected List<Message> extractRegularMessages(
+            List<ChatMessage> messages, BedrockCachePointPlacement cachePointPlacement) {
         List<Message> bedrockMessages = new ArrayList<>();
         List<ContentBlock> currentBlocks = new ArrayList<>();
+        boolean firstUserMessageProcessed = false;
 
         for (int i = 0; i < messages.size(); i++) {
             ChatMessage msg = messages.get(i);
             if (msg instanceof ToolExecutionResultMessage toolResult) {
                 handleToolResult(toolResult, currentBlocks, bedrockMessages, i, messages);
             } else if (!(msg instanceof SystemMessage)) {
-                bedrockMessages.add(convertToBedRockMessage(msg));
+                Message bedrockMessage = convertToBedRockMessage(msg);
+
+                if (cachePointPlacement == BedrockCachePointPlacement.AFTER_USER_MESSAGE
+                        && msg instanceof UserMessage
+                        && !firstUserMessageProcessed) {
+
+                    List<ContentBlock> contentWithCachePoint = new ArrayList<>(bedrockMessage.content());
+                    contentWithCachePoint.add(ContentBlock.builder()
+                            .cachePoint(software.amazon.awssdk.services.bedrockruntime.model.CachePointBlock.builder()
+                                    .type("default")
+                                    .build())
+                            .build());
+
+                    bedrockMessage = Message.builder()
+                            .role(bedrockMessage.role())
+                            .content(contentWithCachePoint)
+                            .build();
+
+                    firstUserMessageProcessed = true;
+                }
+
+                bedrockMessages.add(bedrockMessage);
             }
         }
 
@@ -200,7 +259,9 @@ abstract class AbstractBedrockChatModel {
                             .signature(message.attribute(THINKING_SIGNATURE_KEY, String.class))
                             .build())
                     .build();
-            blocks.add(ContentBlock.builder().reasoningContent(reasoningContentBlock).build());
+            blocks.add(ContentBlock.builder()
+                    .reasoningContent(reasoningContentBlock)
+                    .build());
         }
 
         if (message.text() != null) {
@@ -275,6 +336,11 @@ abstract class AbstractBedrockChatModel {
     }
 
     protected ToolConfiguration extractToolConfigurationFrom(ChatRequest chatRequest) {
+        return extractToolConfigurationFrom(chatRequest, null);
+    }
+
+    protected ToolConfiguration extractToolConfigurationFrom(
+            ChatRequest chatRequest, BedrockCachePointPlacement cachePointPlacement) {
         List<ToolSpecification> toolSpecifications = chatRequest.toolSpecifications();
         ChatRequestParameters parameters = chatRequest.parameters();
 
@@ -298,6 +364,14 @@ abstract class AbstractBedrockChatModel {
                     .toList();
 
             allTools.addAll(tools);
+
+            if (cachePointPlacement == BedrockCachePointPlacement.AFTER_TOOLS) {
+                allTools.add(Tool.builder()
+                        .cachePoint(software.amazon.awssdk.services.bedrockruntime.model.CachePointBlock.builder()
+                                .type("default")
+                                .build())
+                        .build());
+            }
         }
 
         if (allTools.isEmpty()) {
@@ -327,9 +401,9 @@ abstract class AbstractBedrockChatModel {
                         .arguments(documentToJson(cBlock.toolUse().input()))
                         .build());
             } else if (cBlock.type() == ContentBlock.Type.TEXT) {
-                 if (isNotNullOrEmpty(cBlock.text())) {
-                     texts.add(cBlock.text());
-                 }
+                if (isNotNullOrEmpty(cBlock.text())) {
+                    texts.add(cBlock.text());
+                }
             } else if (cBlock.type() == ContentBlock.Type.REASONING_CONTENT) {
                 if (returnThinking) {
                     ReasoningContentBlock reasoningContentBlock = cBlock.reasoningContent();
@@ -361,10 +435,16 @@ abstract class AbstractBedrockChatModel {
                 .build();
     }
 
-    protected TokenUsage tokenUsageFrom(software.amazon.awssdk.services.bedrockruntime.model.TokenUsage tokenUsage) {
+    protected BedrockTokenUsage tokenUsageFrom(
+            software.amazon.awssdk.services.bedrockruntime.model.TokenUsage tokenUsage) {
         return Optional.ofNullable(tokenUsage)
-                .map(usage -> new TokenUsage(usage.inputTokens(), usage.outputTokens(), usage.totalTokens()))
-                .orElseGet(TokenUsage::new);
+                .map(usage -> BedrockTokenUsage.builder()
+                        .inputTokenCount(tokenUsage.inputTokens())
+                        .outputTokenCount(tokenUsage.outputTokens())
+                        .cacheWriteInputTokens(tokenUsage.cacheWriteInputTokens())
+                        .cacheReadInputTokens(tokenUsage.cacheReadInputTokens())
+                        .build())
+                .orElseGet(BedrockTokenUsage.builder()::build);
     }
 
     protected FinishReason finishReasonFrom(StopReason stopReason) {
@@ -380,6 +460,10 @@ abstract class AbstractBedrockChatModel {
             return FinishReason.TOOL_EXECUTION;
         }
 
+        if (stopReason == StopReason.CONTENT_FILTERED || stopReason == StopReason.GUARDRAIL_INTERVENED) {
+            return FinishReason.CONTENT_FILTER;
+        }
+
         throw new IllegalArgumentException("Unknown stop reason: " + stopReason);
     }
 
@@ -388,7 +472,34 @@ abstract class AbstractBedrockChatModel {
                 .maxTokens(parameters.maxOutputTokens())
                 .temperature(dblToFloat(parameters.temperature()))
                 .topP(dblToFloat(parameters.topP()))
-                .stopSequences(parameters.stopSequences())
+                .stopSequences(isNullOrEmpty(parameters.stopSequences()) ? null : parameters.stopSequences())
+                .build();
+    }
+
+    protected GuardrailConfiguration guardrailConfigFrom(BedrockGuardrailConfiguration bedrockGuardrailConfiguration) {
+
+        if (bedrockGuardrailConfiguration == null) {
+            return null;
+        }
+
+        return GuardrailConfiguration.builder()
+                .guardrailVersion(bedrockGuardrailConfiguration.guardrailVersion())
+                .guardrailIdentifier(bedrockGuardrailConfiguration.guardrailIdentifier())
+                .trace(GuardrailTrace.ENABLED)
+                .build();
+    }
+
+    protected GuardrailStreamConfiguration guardrailStreamConfigFrom(
+            BedrockGuardrailConfiguration bedrockGuardrailConfiguration) {
+
+        if (bedrockGuardrailConfiguration == null) {
+            return null;
+        }
+
+        return GuardrailStreamConfiguration.builder()
+                .guardrailVersion(bedrockGuardrailConfiguration.guardrailVersion())
+                .guardrailIdentifier(bedrockGuardrailConfiguration.guardrailIdentifier())
+                .trace(GuardrailTrace.ENABLED)
                 .build();
     }
 
@@ -406,6 +517,208 @@ abstract class AbstractBedrockChatModel {
         } else {
             return convertAdditionalModelRequestFields(additionalModelRequestFieldsMap);
         }
+    }
+
+    protected GuardrailAssessmentSummary guardrailAssessmentSummaryFrom(ConverseTrace trace) {
+
+        if (trace == null) {
+            return null;
+        }
+
+        GuardrailAssessmentSummary.Builder builder = GuardrailAssessmentSummary.builder();
+
+        if (trace.guardrail().hasInputAssessment()) {
+            List<GuardrailAssessment> inputAssessments = new ArrayList<>();
+
+            for (var assessment : trace.guardrail().inputAssessment().values()) {
+
+                // --- Topic Policy ---
+                var topicPolicy = assessment.topicPolicy();
+                if (topicPolicy != null && topicPolicy.topics() != null) {
+                    for (var policy : topicPolicy.topics()) {
+                        inputAssessments.add(InputGuardrailAssessment.builder()
+                                .policy(TOPIC)
+                                .name(policy.name())
+                                .action(policy.actionAsString())
+                                .build());
+                    }
+                }
+
+                // --- Content Policy ---
+                var contentPolicy = assessment.contentPolicy();
+                if (contentPolicy != null && contentPolicy.filters() != null) {
+                    for (var policy : contentPolicy.filters()) {
+                        inputAssessments.add(InputGuardrailAssessment.builder()
+                                .policy(CONTENT)
+                                .name(policy.typeAsString())
+                                .action(policy.actionAsString())
+                                .build());
+                    }
+                }
+
+                // --- Word Policy ---
+                var wordPolicy = assessment.wordPolicy();
+                if (wordPolicy != null) {
+                    if (wordPolicy.customWords() != null) {
+                        for (var policy : wordPolicy.customWords()) {
+                            inputAssessments.add(InputGuardrailAssessment.builder()
+                                    .policy(WORD)
+                                    .name(policy.match())
+                                    .action(policy.actionAsString())
+                                    .build());
+                        }
+                    }
+                    if (wordPolicy.managedWordLists() != null) {
+                        for (var policy : wordPolicy.managedWordLists()) {
+                            inputAssessments.add(InputGuardrailAssessment.builder()
+                                    .policy(WORD)
+                                    .name(policy.typeAsString())
+                                    .action(policy.actionAsString())
+                                    .build());
+                        }
+                    }
+                }
+
+                // --- Sensitive Information Policy ---
+                var sensitivePolicy = assessment.sensitiveInformationPolicy();
+                if (sensitivePolicy != null) {
+                    if (sensitivePolicy.piiEntities() != null) {
+                        for (var policy : sensitivePolicy.piiEntities()) {
+                            inputAssessments.add(InputGuardrailAssessment.builder()
+                                    .policy(SENSITIVE)
+                                    .name(policy.typeAsString())
+                                    .action(policy.actionAsString())
+                                    .build());
+                        }
+                    }
+                    if (sensitivePolicy.regexes() != null) {
+                        for (var policy : sensitivePolicy.regexes()) {
+                            inputAssessments.add(InputGuardrailAssessment.builder()
+                                    .policy(SENSITIVE)
+                                    .name(policy.name())
+                                    .action(policy.actionAsString())
+                                    .build());
+                        }
+                    }
+                }
+
+                // --- Contextual Grounding Policy ---
+                var contextualPolicy = assessment.contextualGroundingPolicy();
+                if (contextualPolicy != null && contextualPolicy.filters() != null) {
+                    for (var policy : contextualPolicy.filters()) {
+                        inputAssessments.add(InputGuardrailAssessment.builder()
+                                .policy(CONTEXT)
+                                .name(policy.typeAsString())
+                                .action(policy.actionAsString())
+                                .build());
+                    }
+                }
+            }
+
+            builder.inputAssessments(inputAssessments);
+        }
+
+        if (trace.guardrail().hasOutputAssessments()) {
+
+            List<GuardrailAssessment> outputAssessments = new ArrayList<>();
+            var outputAssessmentValues = trace.guardrail().outputAssessments();
+
+            if (outputAssessmentValues != null) {
+                for (var assessments : outputAssessmentValues.values()) {
+                    if (assessments == null) continue;
+
+                    for (var assessment : assessments) {
+                        if (assessment == null) continue;
+
+                        // --- Topic Policy ---
+                        var topicPolicy = assessment.topicPolicy();
+                        if (topicPolicy != null && topicPolicy.topics() != null) {
+                            for (var policy : topicPolicy.topics()) {
+                                outputAssessments.add(OutputGuardrailAssessment.builder()
+                                        .policy(TOPIC)
+                                        .name(policy.name())
+                                        .action(policy.actionAsString())
+                                        .build());
+                            }
+                        }
+
+                        // --- Content Policy ---
+                        var contentPolicy = assessment.contentPolicy();
+                        if (contentPolicy != null && contentPolicy.filters() != null) {
+                            for (var policy : contentPolicy.filters()) {
+                                outputAssessments.add(OutputGuardrailAssessment.builder()
+                                        .policy(CONTENT)
+                                        .name(policy.typeAsString())
+                                        .action(policy.actionAsString())
+                                        .build());
+                            }
+                        }
+
+                        // --- Word Policy ---
+                        var wordPolicy = assessment.wordPolicy();
+                        if (wordPolicy != null) {
+                            if (wordPolicy.customWords() != null) {
+                                for (var policy : wordPolicy.customWords()) {
+                                    outputAssessments.add(OutputGuardrailAssessment.builder()
+                                            .policy(WORD)
+                                            .name(policy.match())
+                                            .action(policy.actionAsString())
+                                            .build());
+                                }
+                            }
+                            if (wordPolicy.managedWordLists() != null) {
+                                for (var policy : wordPolicy.managedWordLists()) {
+                                    outputAssessments.add(OutputGuardrailAssessment.builder()
+                                            .policy(WORD)
+                                            .name(policy.typeAsString())
+                                            .action(policy.actionAsString())
+                                            .build());
+                                }
+                            }
+                        }
+
+                        // --- Sensitive Information Policy ---
+                        var sensitivePolicy = assessment.sensitiveInformationPolicy();
+                        if (sensitivePolicy != null) {
+                            if (sensitivePolicy.piiEntities() != null) {
+                                for (var policy : sensitivePolicy.piiEntities()) {
+                                    outputAssessments.add(OutputGuardrailAssessment.builder()
+                                            .policy(SENSITIVE)
+                                            .name(policy.typeAsString())
+                                            .action(policy.actionAsString())
+                                            .build());
+                                }
+                            }
+                            if (sensitivePolicy.regexes() != null) {
+                                for (var policy : sensitivePolicy.regexes()) {
+                                    outputAssessments.add(OutputGuardrailAssessment.builder()
+                                            .policy(SENSITIVE)
+                                            .name(policy.name())
+                                            .action(policy.actionAsString())
+                                            .build());
+                                }
+                            }
+                        }
+
+                        // --- Contextual Grounding Policy ---
+                        var contextualPolicy = assessment.contextualGroundingPolicy();
+                        if (contextualPolicy != null && contextualPolicy.filters() != null) {
+                            for (var policy : contextualPolicy.filters()) {
+                                outputAssessments.add(OutputGuardrailAssessment.builder()
+                                        .policy(CONTEXT)
+                                        .name(policy.typeAsString())
+                                        .action(policy.actionAsString())
+                                        .build());
+                            }
+                        }
+                    }
+                }
+            }
+
+            builder.ouputAssessments(outputAssessments);
+        }
+
+        return builder.build();
     }
 
     protected static void validate(ChatRequestParameters parameters) {
@@ -451,6 +764,7 @@ abstract class AbstractBedrockChatModel {
         protected ChatRequestParameters defaultRequestParameters;
         protected Boolean logRequests;
         protected Boolean logResponses;
+        protected Logger logger;
         protected List<ChatModelListener> listeners;
 
         @SuppressWarnings("unchecked")
@@ -475,7 +789,7 @@ abstract class AbstractBedrockChatModel {
 
         /**
          * Controls whether to return thinking/reasoning text (if available) inside {@link AiMessage#thinking()}
-         * and whether to invoke the {@link dev.langchain4j.model.chat.response.StreamingChatResponseHandler#onPartialThinking(PartialThinking)} callback.
+         * and whether to invoke the {@link StreamingChatResponseHandler#onPartialThinking(PartialThinking)} callback.
          * Please note that this does not enable thinking/reasoning for the LLM;
          * it only controls whether to parse the {@code REASONING_CONTENT} block from the API response
          * and return it inside the {@link AiMessage}.
@@ -519,6 +833,15 @@ abstract class AbstractBedrockChatModel {
 
         public T logResponses(Boolean logResponses) {
             this.logResponses = logResponses;
+            return self();
+        }
+
+        /**
+         * @param logger an alternate {@link Logger} to be used instead of the default one provided by Langchain4J for logging requests and responses.
+         * @return {@code this}.
+         */
+        public T logger(Logger logger) {
+            this.logger = logger;
             return self();
         }
 

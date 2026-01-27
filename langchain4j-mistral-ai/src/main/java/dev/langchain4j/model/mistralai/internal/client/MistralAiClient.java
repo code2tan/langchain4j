@@ -7,6 +7,7 @@ import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.mistralai.internal.api.*;
 import dev.langchain4j.spi.ServiceHelper;
 import java.time.Duration;
+import org.slf4j.Logger;
 
 @Internal
 public abstract class MistralAiClient {
@@ -44,6 +45,7 @@ public abstract class MistralAiClient {
         public Duration timeout;
         public Boolean logRequests;
         public Boolean logResponses;
+        public Logger logger;
         public HttpClientBuilder httpClientBuilder;
 
         public abstract T build();
@@ -84,6 +86,11 @@ public abstract class MistralAiClient {
                 logResponses = false;
             }
             this.logResponses = logResponses;
+            return (B) this;
+        }
+
+        public B logger(Logger logger) {
+            this.logger = logger;
             return (B) this;
         }
 
